@@ -1,0 +1,118 @@
+name: 🚀 Chrome Stealth Scraper
+
+run-name: 🚀 Chrome Stealth Scraper (Batch ${{ inputs.batch || '1' }})
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "Current batch number"
+        required: false
+        default: "1"
+        type: string
+      debug_dump:
+        description: "Save screenshot + HTML when history is missing/blocked (1 = yes)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+# Only one run at a time; a newly queued run waits for the current one.
+concurrency:
+  group: zillow-scraper
+  cancel-in-progress: false
+
+env:
+  MAX_BATCHES: '60'   # safety cap so a permanently blocked run can't loop forever
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    outputs:
+      has_more: ${{ steps.scraper_task.outputs.has_more }}
+      blocked:  ${{ steps.scraper_task.outputs.blocked }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Puppeteer Chrome
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+
+      - name: Install Dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Check system Chrome
+        run: google-chrome --version
+
+      - name: Run Scraper Engine (real Chrome, headful under xvfb)
+        id: scraper_task
+        # Run node directly (not via npm) so cancel signals reach the script,
+        # which flushes pending rows before exiting.
+        run: xvfb-run -a --server-args="-screen 0 1400x900x24" node index.js
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          HEADFUL: '1'
+          CHROME_PATH: /usr/bin/google-chrome
+          CONCURRENCY: '2'
+          MAX_URLS_PER_RUN: '150'
+          BLOCK_RESOURCES: '1'
+          INCLUDE_PAGE_TEXT: '0'
+          RETRY_BLOCKED: '1'
+          MAX_BLOCK_STREAK: '6'
+          DEBUG_DUMP: ${{ inputs.debug_dump || '0' }}
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-batch-${{ inputs.batch || '1' }}
+          path: debug/
+          if-no-files-found: ignore
+
+      # ---- SELF-REBOOT: only if NOT cancelled, has_more=true AND not blocked ----
+      - name: Evaluate Self-Reboot Sequence
+        if: |
+          !cancelled() &&
+          steps.scraper_task.outputs.has_more == 'true' &&
+          steps.scraper_task.outputs.blocked != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_BATCH="${{ inputs.batch || '1' }}"
+          NEXT_BATCH=$((CURRENT_BATCH + 1))
+
+          if [ "$NEXT_BATCH" -gt "$MAX_BATCHES" ]; then
+            echo "Reached MAX_BATCHES ($MAX_BATCHES) — not triggering another batch."
+            exit 0
+          fi
+
+          echo "Batch $CURRENT_BATCH hit threshold. Triggering Batch $NEXT_BATCH..."
+          gh workflow run scraper.yml --ref main -f batch="$NEXT_BATCH"
+          sleep 5
+
+      # ---- CLEAN EXIT: runs even on cancel, logs the stop ----
+      - name: Cleanup on Cancel
+        if: cancelled()
+        run: |
+          echo "🛑 Workflow was cancelled — self-reboot skipped."
