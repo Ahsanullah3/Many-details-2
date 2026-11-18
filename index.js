@@ -146,43 +146,73 @@ const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$
 // =========================================================
 // ZOOM + PAGE SCROLL (top -> bottom, TWICE)
 // =========================================================
+const SCROLL_CONTAINER_SELECTORS = [
+    '.layout-container',
+    '[data-testid="hdp-scroll-container"]',
+    '#layout-wrapper .layout-container',
+    '#layout-wrapper',
+    '.layout-column',
+    'main',
+];
+
 async function zoomAndScroll(page, tag) {
     try {
-        await page.evaluate(async (zoomPct) => {
+        await page.evaluate(async ({ zoomPct, selectors }) => {
             const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
             const hasHistory = () => Array.from(document.querySelectorAll('h2,h3,h4'))
                 .some(x => (x.textContent || '').replace(/\u00A0/g, ' ').trim().toLowerCase() === 'price history');
 
-            // Zoom out so far more of the page is in the viewport at once
+            const findScroller = () => {
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.scrollHeight > el.clientHeight + 50) return el;
+                }
+                return null;
+            };
+
+            // Zoom out so more of the page is in the viewport at once
             document.documentElement.style.zoom = String(zoomPct / 100);
             await frame();
 
-            const step = Math.max(200, window.innerHeight);
+            const scroller = findScroller();
+
+            // Unified API over "scroll whatever actually scrolls".
+            const getScrollTop = () => scroller ? scroller.scrollTop : window.scrollY;
+            const getScrollHeight = () => scroller ? scroller.scrollHeight : document.documentElement.scrollHeight;
+            const getClientHeight = () => scroller ? scroller.clientHeight : window.innerHeight;
+            const scrollToTop = () => scroller ? (scroller.scrollTop = 0) : window.scrollTo(0, 0);
+            const scrollByStep = (px) => scroller
+                ? (scroller.scrollTop = scroller.scrollTop + px)
+                : window.scrollBy(0, px);
+            const scrollToBottom = () => scroller
+                ? (scroller.scrollTop = scroller.scrollHeight)
+                : window.scrollTo(0, document.documentElement.scrollHeight);
+
+            const step = Math.max(200, getClientHeight());
 
             // ---- Two full top -> bottom passes ----
             for (let pass = 0; pass < 2; pass++) {
-                // Jump back to the top at the start of each pass
-                window.scrollTo(0, 0);
+                scrollToTop();
                 await frame();
 
                 let lastHeight = -1, stable = 0;
 
-                for (let round = 0; round < 60; round++) {
-                    window.scrollBy(0, step);
+                for (let round = 0; round < 80; round++) {
+                    scrollByStep(step);
                     await frame();
-                    const h = document.documentElement.scrollHeight;
-                    const atBottom = (window.scrollY + window.innerHeight) >= (h - 5);
-                    // Early-exit only on the SECOND pass once history is mounted at bottom
+                    const h = getScrollHeight();
+                    const atBottom = (getScrollTop() + getClientHeight()) >= (h - 5);
+                    // Early-exit only on pass 1 once history is mounted at the bottom
                     if (hasHistory() && atBottom && pass === 1) break;
                     if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
                     if (atBottom && stable >= 2) break;
                 }
             }
 
-            // Final jump to bottom so the history table is in view
-            window.scrollTo(0, document.documentElement.scrollHeight);
+            // Final jump to bottom so the price-history table is in view
+            scrollToBottom();
             await frame();
-        }, ZOOM_PERCENT);
+        }, { zoomPct: ZOOM_PERCENT, selectors: SCROLL_CONTAINER_SELECTORS });
     } catch (e) {
         console.log(`   ⚠️ [${tag}] zoomAndScroll error: ${e.message}`);
     }
