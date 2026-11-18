@@ -66,8 +66,6 @@ const AD_HOSTS = /doubleclick|googletagmanager|google-analytics|googlesyndicatio
 // GLOBAL CANCEL FLAG
 // =========================================================
 // Set by SIGINT / SIGTERM. Workers check this before claiming new rows.
-// `mainStop` is a module-scope mirror so signal handlers registered
-// outside runScraper can flip it safely.
 let mainStop = false;
 process.once('SIGINT',  () => { mainStop = true; console.log('🛑 SIGINT received — stopping after current URLs flush.'); });
 process.once('SIGTERM', () => { mainStop = true; console.log('🛑 SIGTERM received — stopping after current URLs flush.'); });
@@ -146,7 +144,7 @@ function findNextRow(sheet, afterRow, mode) {
 const urlKey = (u) => String(u).trim().split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
 
 // =========================================================
-// ZOOM + PAGE SCROLL
+// ZOOM + PAGE SCROLL (top -> bottom, TWICE)
 // =========================================================
 async function zoomAndScroll(page, tag) {
     try {
@@ -155,22 +153,33 @@ async function zoomAndScroll(page, tag) {
             const hasHistory = () => Array.from(document.querySelectorAll('h2,h3,h4'))
                 .some(x => (x.textContent || '').replace(/\u00A0/g, ' ').trim().toLowerCase() === 'price history');
 
+            // Zoom out so far more of the page is in the viewport at once
             document.documentElement.style.zoom = String(zoomPct / 100);
             await frame();
 
             const step = Math.max(200, window.innerHeight);
-            let lastHeight = -1, stable = 0;
 
-            for (let round = 0; round < 60; round++) {
-                window.scrollBy(0, step);
+            // ---- Two full top -> bottom passes ----
+            for (let pass = 0; pass < 2; pass++) {
+                // Jump back to the top at the start of each pass
+                window.scrollTo(0, 0);
                 await frame();
-                const h = document.documentElement.scrollHeight;
-                const atBottom = (window.scrollY + window.innerHeight) >= (h - 5);
-                if (hasHistory() && atBottom) break;
-                if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
-                if (atBottom && stable >= 2) break;
+
+                let lastHeight = -1, stable = 0;
+
+                for (let round = 0; round < 60; round++) {
+                    window.scrollBy(0, step);
+                    await frame();
+                    const h = document.documentElement.scrollHeight;
+                    const atBottom = (window.scrollY + window.innerHeight) >= (h - 5);
+                    // Early-exit only on the SECOND pass once history is mounted at bottom
+                    if (hasHistory() && atBottom && pass === 1) break;
+                    if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
+                    if (atBottom && stable >= 2) break;
+                }
             }
 
+            // Final jump to bottom so the history table is in view
             window.scrollTo(0, document.documentElement.scrollHeight);
             await frame();
         }, ZOOM_PERCENT);
@@ -601,7 +610,7 @@ async function dumpDebug(page, label) {
 // =========================================================
 async function runScraper() {
     const startTime = Date.now();
-    console.log(`🚀 Zillow Scraper V28 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
+    console.log(`🚀 Zillow Scraper V29 | concurrency ${CONCURRENCY} | max ${MAX_URLS_PER_RUN}`);
 
     const setOutput = (hasMore, blocked) => {
         if (process.env.GITHUB_OUTPUT) {
@@ -609,13 +618,9 @@ async function runScraper() {
         }
     };
 
-    // Local mirror of the global cancel flag; signal handlers set mainStop.
-    // We sync it into `stop` inside the worker loop.
     let stop = false;
     let blockedExit = false;
 
-    // Propagate a global cancel into the local stop flag.
-    // (Polled at claim time — no interval needed.)
     const syncCancel = () => {
         if (mainStop) stop = true;
     };
@@ -688,13 +693,12 @@ async function runScraper() {
     let claimed = 0, success = 0;
     let totalBlocks = 0, totalErrors = 0;
     let totalWithHistory = 0, totalWithTableFound = 0;
+    let totalHoaRetries = 0, totalHoaRecovered = 0;
     let cursor = -1;
     let phase = 'fresh';
     const inflight = new Map();
 
     // ---- Serialized streak counters (no cross-worker races) -------------
-    // Any worker's block/error must increment atomically so the 6-streak
-    // trigger is deterministic regardless of CONCURRENCY.
     let streakChain = Promise.resolve();
     let blockStreak = 0;
     let errorStreak = 0;
@@ -737,7 +741,6 @@ async function runScraper() {
                 if (Date.now() - startTime >= MAX_RUNTIME_MS) break;
                 if (claimed >= MAX_URLS_PER_RUN) break;
 
-                // Non-blocking error-streak check (serialized)
                 const errLimitHit = await (streakChain = streakChain.then(() => errorStreak >= MAX_CONSECUTIVE_ERRORS));
                 if (errLimitHit) { stop = true; break; }
 
@@ -746,6 +749,7 @@ async function runScraper() {
                 claimed++;
                 const url = String(safeValue(sheet, rowIndex, 0));
                 const actualRow = rowIndex + 1;
+                const tag = String(url).slice(-22);
                 console.log(`🕵️ [W${id}] Row ${actualRow} (${claimed}/${MAX_URLS_PER_RUN}) [${phase}]: ${url}`);
 
                 let recycle = false;
@@ -758,7 +762,32 @@ async function runScraper() {
                     used++;
 
                     const key = urlKey(url);
-                    if (!inflight.has(key)) inflight.set(key, scrapeOneUrl(browser, url));
+                    if (!inflight.has(key)) inflight.set(key, (async () => {
+                        // ---- First pass ----
+                        let result = await scrapeOneUrl(browser, url);
+
+                        // ---- HOA retry: close browser, relaunch, re-scrape once ----
+                        if (!result.blocked && result.data && !result.data.hoa) {
+                            totalHoaRetries++;
+                            console.log(`   🔁 [${tag}] HOA missing — recycling browser and re-scraping URL`);
+                            try { await closeBrowser(browser); } catch (e) {}
+                            browser = await launchBrowser();
+                            used = 0;
+
+                            const second = await scrapeOneUrl(browser, url);
+                            if (!second.blocked && second.data && second.data.hoa) {
+                                totalHoaRecovered++;
+                                console.log(`   ✅ [${tag}] HOA recovered on retry: ${second.data.hoa}`);
+                                result = second;
+                            } else if (second.blocked) {
+                                console.log(`   ⚠️ [${tag}] Retry got blocked — keeping first pass`);
+                            } else {
+                                console.log(`   ⚠️ [${tag}] HOA still missing after retry — accepting second pass`);
+                                result = second;
+                            }
+                        }
+                        return result;
+                    })());
                     const result = await inflight.get(key);
 
                     if (result.blocked) {
@@ -786,7 +815,7 @@ async function runScraper() {
                             queue.push({ row: rowIndex, status, d });
                             success++;
                             await recordSuccess();
-                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
+                            console.log(`✔️ [W${id}] ${d.fullAddress || '?'} | 💰 ${d.price || '?'} | 🏠 HOA: ${d.hoa || 'MISSING'} | 📊 Hist: ${hasHistory ? d.priceHistoryText.split('\n').length : 'NO'} | 📄 Text: ${d.pageText ? d.pageText.length : 0} chars | 🏷️ ${d.mls || '—'}`);
                         }
                     }
                 } catch (e) {
@@ -812,13 +841,10 @@ async function runScraper() {
 
     console.log(`\n📊 ─── RUN TOTALS ───`);
     console.log(`✅ Success: ${success} | 🚫 Blocked: ${totalBlocks} | 🛑 Errors: ${totalErrors}`);
+    console.log(`🏠 HOA retries: ${totalHoaRetries} | 🏠 HOA recovered: ${totalHoaRecovered}`);
     console.log(`📊 Rows with history: ${totalWithHistory} | 📊 History-section rows: ${totalWithTableFound}`);
     console.log(`⏱️ Runtime: ${Math.round((Date.now() - startTime) / 1000)}s`);
 
-    // ---- EXIT PATH ------------------------------------------------
-    // If we were cancelled mid-run, we still write has_more so the
-    // workflow can decide; but blockedExit is false, so no spurious
-    // "blocked" signal is sent.
     if (mainStop && !blockedExit) {
         const remaining = findNextRow(sheet, -1, 'fresh');
         const hasMore = remaining !== -1;
