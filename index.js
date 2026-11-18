@@ -33,7 +33,7 @@ const DEBUG_DUMP = process.env.DEBUG_DUMP === '1';
 const VIEWPORT_W = Number(process.env.VIEWPORT_W || '1400');
 const VIEWPORT_H = Number(process.env.VIEWPORT_H || '900');
 const HYDRATE_TIMEOUT = Number(process.env.HYDRATE_TIMEOUT || '12000');
-const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20000');
+const HISTORY_WAIT_MS = Number(process.env.HISTORY_WAIT_MS || '20');
 const ZOOM_PERCENT = Number(process.env.ZOOM_PERCENT || '20');   // page zoom level
 
 const HEADER_START_COL = 9;
